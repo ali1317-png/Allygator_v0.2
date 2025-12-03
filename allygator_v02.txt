@@ -1,0 +1,2113 @@
+main.py************************
+
+
+
+import tkinter as tk
+import threading
+import time
+import pandas as pd
+import os
+import sys
+import datetime
+import ta.volatility
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Kendi modüllerimiz
+sys.path.append(os.path.dirname(os.path.abspath(__file__))) 
+
+from config import (TESTNET_API_KEY, TESTNET_SECRET_KEY, TESTNET_BASE_URL, 
+                    REAL_API_KEY, REAL_SECRET_KEY, REAL_BASE_URL)
+from gui import BotGUI 
+from strategies.score import SignalEngine
+from strategy import StrategyCore 
+from binance.um_futures import UMFutures
+from binance.error import ClientError
+
+# --- YENİ EKLEME: Risk Modülü ---
+from strategies.risk import calculate_dynamic_stops
+from strategies.risk import (
+    calc_chandelier_exit,
+    calc_swing_exit,
+    calc_msb_exit
+)
+# --------------------------------
+
+# LOGLARI SUSTURMA
+import logging
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+UPDATE_INTERVAL_SECONDS = 5 
+SCAN_INTERVAL_SECONDS = 120 
+
+class AllyGatorLogic:
+    def __init__(self, root):
+        self.root = root
+        #self.log = log_func if log_func else print
+        
+        # Durum Değişkenleri
+        self.is_running = False        
+        self.trading_active = False    
+        self.client: UMFutures = None  
+        self.strategy_core: StrategyCore = None
+        
+        # Hesap İstatistikleri
+        self.current_balance = 0.0
+        self.start_balance = 0.0
+        self.bot_realized_pnl = 0.0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_position_value = 0.0 
+        self.total_trades_count = 0
+        
+        self.start_time = None
+        self.previous_symbols = set()   
+        self.touched_symbols = set()    
+        self.trailing_peaks = {}        
+
+        # GUI Başlatma
+        self.gui = BotGUI(
+            root,
+            start_callback=self.start_bot_monitor,      
+            stop_callback=self.stop_bot_monitor,        
+            toggle_trading_callback=self.toggle_trading,
+            close_all_callback=self.close_all_positions,
+            emergency_stop_callback=self.emergency_stop
+        )
+        
+        self.gui.log("AllyGator v0.2 başlatıldı. (Modüler)", force=True)
+        self.trading_active = self.gui.trading_active
+        self.position_monitor_active = False
+
+    # --- 1. GUI ETKİLEŞİMİ ---
+
+    def start_bot_monitor(self):
+        if self.is_running: return
+
+        is_testnet = self.gui.mode_var.get() == 1
+        if is_testnet:
+            api_key = TESTNET_API_KEY
+            secret_key = TESTNET_SECRET_KEY
+            base_url = TESTNET_BASE_URL
+        else:
+            api_key = REAL_API_KEY
+            secret_key = REAL_SECRET_KEY
+            base_url = REAL_BASE_URL
+
+        if not api_key or not secret_key:
+            self.gui.log("HATA: API Key yok!", force=True)
+            self.gui.on_stop_press()
+            return
+        
+        try:
+            self.client = UMFutures(key=api_key, secret=secret_key, base_url=base_url)
+            self.gui.log("✅ Bağlantı başarılı.", force=True)
+        except Exception as e:
+            self.gui.log(f"❌ Bağlantı Hatası: {e}", force=True)
+            self.gui.on_stop_press()
+            return
+        
+        self.strategy_core = StrategyCore(self.client, self.gui.settings, self.gui.log)
+        self.is_running = True
+        self.start_time = time.time()
+        self.position_monitor_active = True
+        self.gui.log("Bot izleme döngüsü başlatıldı.", force=True)
+        
+        
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+        self.get_account_info()
+        self.start_balance = self.current_balance
+        self.gui.log(f"💰 Başlangıç Bakiyesi Kaydedildi: {self.start_balance:.2f} USDT", force=True)
+        
+        self.root.after(1000, self.update_gui_stats)
+        
+    def stop_bot_monitor(self):
+        self.is_running = False
+        self.trading_active = False
+        self.position_monitor_active = False
+
+    def toggle_trading(self, active_state):
+        self.trading_active = active_state
+        self.gui.trading_active = active_state
+        
+        if self.trading_active:
+            self.gui.log("ALIM MODU AKTİF. Coin taraması başlatılıyor...", force=True)
+            threading.Thread(target=self.scan_and_trade_loop, daemon=True).start()
+        else:
+            self.gui.log("ALIM MODU PASİF. Sinyal işleme durduruldu.", force=True)
+
+    def emergency_stop(self):
+        self.stop_bot_monitor()
+        self.close_all_positions()
+
+    # --- 2. ANA DÖNGÜLER ---
+
+    def monitor_loop(self):
+        """TEK BİRLEŞTİRİLMİŞ MONITOR LOOP - Tüm pozisyon izlemeleri burada"""
+        while self.is_running and self.position_monitor_active:
+            try:
+                # 1. Hesap bilgilerini güncelle
+                self.get_account_info()
+                
+                # 2. Pozisyonları al
+                positions = self.client.get_position_risk()
+                current_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
+                current_symbols = {p['symbol'] for p in current_positions}
+
+                # 3. Kapanan pozisyonları tespit et ve temizle
+                closed_symbols = self.previous_symbols - current_symbols
+                for symbol in closed_symbols:
+                    self.gui.log(f"🔚 {symbol} pozisyonu kapandı → temizlik yapılıyor...", force=True)
+                    self.fetch_and_update_pnl(symbol)
+                    self.safe_cancel_all_orders(symbol, reason="Pozisyon kapandı")
+                    self.trailing_peaks.pop(symbol, None)
+
+                self.previous_symbols = current_symbols
+                
+                # 4. AÇIK POZİSYONLARI İZLE - ATR TRAILING STOP
+                for pos in current_positions:
+                    symbol = pos['symbol']
+                    
+                    # ATR Trailing Stop'u güncelle
+                    self.update_trailing_stop(symbol, pos)
+                    
+                    # Ek risk kontrolü (isteğe bağlı)
+                    self.additional_risk_checks(pos)
+                
+                # 5. GUI'yi güncelle
+                self.update_open_positions()
+
+            except Exception as e:
+                self.gui.log(f"Monitor loop hatası: {e}", force=False)
+            
+            time.sleep(4)  # 4 saniyede bir kontrol
+
+    def additional_risk_checks(self, position):
+        """Ek risk kontrolleri - zarar kesme vs."""
+        try:
+            symbol = position['symbol']
+            unrealized_pnl = float(position['unRealizedProfit'])
+            
+            # %10'dan fazla zararda kes (acil durum)
+            if unrealized_pnl < -(self.current_balance * 0.10):
+                self.gui.log(f"⛔ ACİL ZARAR KES: {symbol} | Kayıp: {unrealized_pnl:.2f} USDT", force=True)
+                self.close_single_position(symbol)
+                
+        except Exception as e:
+            self.gui.log(f"Risk check hatası: {e}", force=False)
+
+    def update_trailing_stop(self, symbol, position_data):
+        """GÜNCELLENMİŞ ATR Trailing Stop - Mevcut terminoloji korundu"""
+        
+        if symbol not in self.trailing_peaks:
+            return
+
+        try:
+            current_price = float(position_data['markPrice'])
+            position_amt = float(position_data['positionAmt'])
+
+            if position_amt == 0:
+                self.trailing_peaks.pop(symbol, None)
+                return
+
+            trail_data = self.trailing_peaks[symbol]
+            direction = trail_data['direction']
+            atr = trail_data['atr']
+            entry_price = trail_data['entry_price']
+            initial_sl = trail_data['initial_stop_loss']
+
+            # 🚫 ATR KONTROLÜ - Eğer 0 ise düzelt
+            if atr == 0:
+                atr = current_price * 0.01  # Fiyatın %1'i
+                trail_data['atr'] = atr
+                self.gui.log(f"🔄 {symbol}: ATR 0'dı, düzeltildi: {atr:.6f}")
+
+            # KAR HESABI
+            if direction == "LONG":
+                current_profit = current_price - entry_price
+                profit_pct = (current_profit / entry_price) * 100
+            else:  # SHORT
+                current_profit = entry_price - current_price  
+                profit_pct = (current_profit / entry_price) * 100
+
+            # 🔥 MINIMUM KAR KONTROLÜ - Sadece %1'den (arayüden giriş)fazla karda çalış
+            if profit_pct < self.gui.settings['tp_pct']:
+                return
+
+            # 🔥 PEAK/DIP GÜNCELLEME
+            if direction == "LONG":
+                # Yeni zirve kontrolü
+                if current_price > trail_data['peak_price']:
+                    trail_data['peak_price'] = current_price
+                    # self.gui.log(f"📈 {symbol} Yeni Zirve: {current_price:.6f}")
+
+                # Çıkış fiyatı: Zirve - (ATR × Multiplier)
+                multiplier = trail_data.get('multiplier', 1.8)
+                exit_trigger = trail_data['peak_price'] - (atr * multiplier)
+
+                # TP tetikleme
+                if current_price <= exit_trigger:
+                    self.gui.log(
+                        f"🎯 ATR ÇIKIŞ: {symbol} | Kar: {profit_pct:.2f}% | "
+                        f"Zirve: {trail_data['peak_price']:.6f} → Çıkış: {current_price:.6f}",
+                        force=True
+                    )
+                    self.close_single_position(symbol)
+                    return
+
+            else:  # SHORT
+                # Yeni dip kontrolü
+                if current_price < trail_data['peak_price']:
+                    trail_data['peak_price'] = current_price
+                    # self.gui.log(f"📉 {symbol} Yeni Dip: {current_price:.6f}")
+
+                # Çıkış fiyatı: Dip + (ATR × Multiplier)
+                multiplier = trail_data.get('multiplier', 1.8)
+                exit_trigger = trail_data['peak_price'] + (atr * multiplier)
+
+                if current_price >= exit_trigger:
+                    self.gui.log(
+                        f"🎯 ATR ÇIKIŞ: {symbol} | Kar: {profit_pct:.2f}% | "
+                        f"Dip: {trail_data['peak_price']:.6f} → Çıkış: {current_price:.6f}",
+                        force=True
+                    )
+                    self.close_single_position(symbol)
+                    return
+            df_recent = self.strategy_core.get_candlesticks(symbol, interval='15m', limit=100)
+
+            
+            # 1) Chandelier Exit
+            ce_price = calc_chandelier_exit(df_recent, direction, atr)
+            if ce_price:
+                if direction == "LONG" and current_price <= ce_price:
+                    self.gui.log(f"🎯 CE Exit: {symbol} | {current_price} (CE:{ce_price})", force=True)
+                    self.close_single_position(symbol)
+                    return
+                elif direction == "SHORT" and current_price >= ce_price:
+                    self.gui.log(f"🎯 CE Exit: {symbol} | {current_price} (CE:{ce_price})", force=True)
+                    self.close_single_position(symbol)
+                    return
+
+            # 2) Swing Exit
+            swing_level = calc_swing_exit(df_recent, direction)
+            if swing_level:
+                if direction == "LONG" and current_price < swing_level:
+                    self.gui.log(f"📉 Swing Exit: {symbol}", force=True)
+                    self.close_single_position(symbol)
+                    return
+                elif direction == "SHORT" and current_price > swing_level:
+                    self.gui.log(f"📈 Swing Exit: {symbol}", force=True)
+                    self.close_single_position(symbol)
+                    return
+
+            # 3) MSB Exit
+            msb_level = calc_msb_exit(df_recent, direction)
+            if msb_level:
+                if direction == "LONG" and current_price < msb_level:
+                    self.gui.log(f"💥 MSB Exit: {symbol}", force=True)
+                    self.close_single_position(symbol)
+                    return
+                elif direction == "SHORT" and current_price > msb_level:
+                    self.gui.log(f"💥 MSB Exit: {symbol}", force=True)
+                    self.close_single_position(symbol)
+                    return
+        except Exception as e:
+            self.gui.log(f"❌ Trailing stop hatası ({symbol}): {e}", force=False)
+
+    
+
+
+    def scan_and_trade_loop(self):
+        if not self.strategy_core: return
+        
+        while self.is_running and self.trading_active:
+            try:
+                current_settings = self.gui.get_latest_settings_from_ui()
+                self.strategy_core.settings = current_settings.copy()
+                self.strategy_core.engine.settings = current_settings.copy()  # Engine'i doğrudan güncelle
+                self.gui.settings = current_settings
+
+                symbols = self.strategy_core.get_symbols_to_scan()
+                
+                if not symbols:
+                    self.gui.log("UYARI: Hiçbir sembol filtreyi geçemedi.", force=True)
+                    continue
+                    
+                # DÜZGÜN ThreadPool kullanımı
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    # Tüm sembolleri paralel işle
+                    futures = {}
+                    for symbol in symbols:
+                        if not self.is_running or not self.trading_active:
+                            break
+                        # Her sembol için analiz işlemini başlat
+                        future = executor.submit(self.analyze_and_trade_symbol, symbol)
+                        futures[future] = symbol
+                    
+                    # Sonuçları bekle ve işle
+                    for future in as_completed(futures):
+                        if not self.is_running or not self.trading_active:
+                            break
+                        symbol = futures[future]
+                        try:
+                            result = future.result()
+                            # result burada sinyal bilgisi olacak
+                        except Exception as e:
+                            self.gui.log(f"❌ {symbol} analiz hatası: {e}", force=False)
+                    
+            except Exception as e:
+                self.gui.log(f"❌ Tarama Hatası: {e}", force=True)
+
+            if not self.is_running or not self.trading_active:
+                break
+                
+            self.gui.log(f"Tarama bitti. {SCAN_INTERVAL_SECONDS} sn bekleme...", force=True)
+            time.sleep(SCAN_INTERVAL_SECONDS)
+        
+        if self.trading_active and not self.is_running:
+            self.gui.log("Sistem durduruldu, tarama bitti.", force=True)
+        elif self.is_running and not self.trading_active:
+            self.gui.log("ALIM MODU kapandı, tarama bitti.", force=True)
+
+    # YENİ FONKSİYON EKLE - Thread'lerde çalışacak
+    def analyze_and_trade_symbol(self, symbol):
+        """Tek bir sembolü analiz eder ve trade açar"""
+        try:
+            #self.gui.log(f"-> {symbol} kontrol...", force=False)
+            df = self.strategy_core.get_candlesticks(symbol, interval='15m', limit=100)
+            if df is None: 
+                return None
+                
+            leverage, avg_vol = self.strategy_core.calculate_volatility(df)
+            
+            # Güncellenmiş sinyal çağrısı
+            signal, reason, _, _, _ = self.strategy_core.generate_signal(df, symbol=symbol)
+            
+            if signal != "HOLD":
+                self.gui.log(f"🔔 SİNYAL: {symbol} -> {signal} | Kaldıraç: {leverage}x | Vol: {avg_vol:.2f}% | Sebep: {reason}", force=True)
+                
+                if not self.has_open_position(symbol):
+                    self.open_position(symbol, signal, leverage, df)
+                else:
+                    self.gui.log(f"⚠️ {symbol} zaten açık pozisyon var.", force=False)
+                    
+            return signal
+            
+        except Exception as e:
+            self.gui.log(f"❌ {symbol} işlem hatası: {e}", force=False)
+            return None
+
+    # --- 3. EMİR VE POZİSYON YÖNETİMİ ---
+
+    def has_open_position(self, symbol):
+        try:
+            positions = self.client.get_position_risk(symbol=symbol)
+            for p in positions:
+                if float(p['positionAmt']) != 0:
+                    return True
+            return False
+        except:
+            return False
+
+    def set_leverage_and_margin_mode(self, symbol, leverage):
+        margin_mode = "ISOLATED" if self.gui.isolated_var.get() == 1 else "CROSSED"
+        try:
+            self.client.change_margin_type(symbol=symbol, marginType=margin_mode)
+        except ClientError: pass
+        
+        try:
+            self.client.change_leverage(symbol=symbol, leverage=leverage)
+            return True 
+        except ClientError as ce:
+             self.gui.log(f"❌ Kaldıraç Hatası ({symbol}): {ce.error_message}", force=True)
+             return True
+
+    def round_step_size(self, quantity, step_size):
+        """Basit ve güvenli rounding"""
+        return round(quantity, 6)  # Çoğu coin için yeterli
+
+    def round_price(self, price, tick_size):
+        """Basit ve güvenli rounding"""
+        return round(price, 8)  # Çoğu coin için yeterli
+    
+    def clean_open_orders(self, symbol):
+        try:
+            self.client.cancel_open_orders(symbol=symbol)
+        except Exception: pass
+    
+    def safe_cancel_all_orders(self, symbol, reason="Temizlik"):
+        try:
+            if hasattr(self.client, 'futures_cancel_open_orders'):
+                self.client.futures_cancel_open_orders(symbol=symbol)
+            else:
+                self.client.cancel_open_orders(symbol=symbol)
+                self.gui.log(f"{symbol} → Tüm açık emirler iptal edildi ({reason})", force=True)
+        except Exception: pass
+
+    def fetch_and_update_pnl(self, symbol):
+        """Kapanan pozisyonun sonucunu Binance geçmişinden çeker."""
+        try:
+            trades = self.client.get_account_trades(symbol=symbol, limit=1)
+            if trades:
+                last_trade = trades[0]
+                pnl = float(last_trade.get('realizedPnl', 0))
+                if abs(pnl) > 0:
+                    self.bot_realized_pnl += pnl
+                    if pnl > 0: self.winning_trades += 1
+                    else: self.losing_trades += 1
+                    self.gui.log(f"📝 {symbol} Geçmişten PNL İşlendi: {pnl:.2f} USDT", force=True)
+                    self.root.after(0, self.update_gui_stats)
+        except Exception as e:
+            self.gui.log(f"PNL Geçmiş Hatası ({symbol}): {e}", force=False)
+
+    # --- KRİTİK DEĞİŞİKLİK: open_position artık 'df' alıyor ---
+    def calculate_atr(self, df, period=14):
+        """
+        Average True Range (ATR) hesaplar - GÜVENLİ VERSİYON
+        """
+        try:
+            if len(df) < period + 1:
+                return 0.0
+                
+            atr_indicator = ta.volatility.AverageTrueRange(
+                high=df['High'], low=df['Low'], close=df['Close'], window=period
+            )
+            atr_series = atr_indicator.average_true_range()
+            
+            atr_value = atr_series.iloc[-1] if not atr_series.empty else 0.0
+            
+            if atr_value == 0 or pd.isna(atr_value):
+                current_price = df['Close'].iloc[-1]
+                atr_value = current_price * 0.01
+                
+            return atr_value
+            
+        except Exception as e:
+            current_price = df['Close'].iloc[-1]
+            return current_price * 0.01
+
+    def open_position(self, symbol, signal, leverage, df):
+        if self.has_open_position(symbol):
+            return
+
+        try:
+            account_resp = self.client.account()
+            available_balance = 0.0
+            for asset in account_resp['assets']:
+                if asset['asset'] == 'USDT':
+                    available_balance = float(asset['walletBalance']) # KONTROL ET
+                    break
+        except:
+            available_balance = self.current_balance 
+
+        budget_pct = self.gui.settings['budget_pct'] / 100 
+        investment_amount = available_balance * budget_pct 
+        max_risk_per_trade = available_balance * 0.02
+        investment_amount = min(investment_amount, max_risk_per_trade)
+        
+        if investment_amount < 6: 
+            self.gui.log(f"⚠️ {symbol}: Yetersiz Bakiye ({investment_amount:.2f}).", force=True)
+            return
+
+        self.set_leverage_and_margin_mode(symbol, leverage)
+
+        try:
+            ticker = self.client.ticker_price(symbol)
+            current_price = float(ticker['price'])
+            
+            exchange_info = self.client.exchange_info()
+            step_size = 0.001
+            tick_size = 0.01
+            for s in exchange_info['symbols']:
+                if s['symbol'] == symbol:
+                    for f in s['filters']:
+                        if f['filterType'] == 'LOT_SIZE': 
+                            step_size = float(f['stepSize'])
+                        if f['filterType'] == 'PRICE_FILTER': 
+                            tick_size = float(f['tickSize'])
+                    break
+            
+            qty_raw = (investment_amount * leverage) / current_price 
+            
+            if step_size <= 0:
+                step_size = 0.001
+
+            try:
+                qty_precision = max(0, min(6, int(round(-np.log10(step_size), 0))))
+            except:
+                qty_precision = 3
+
+            quantity = float(f"{qty_raw:.{qty_precision}f}")
+            
+            if quantity == 0: return
+
+            # ATR HESAPLAMA - Risk.py'deki calculate_atr fonksiyonunu kullan
+            #from risk import calculate_atr  # Risk dosyasından import et
+            atr_val = self.calculate_atr(df)
+    
+            # ATR çok küçükse minimum değer kullan
+            current_price = float(ticker['price'])
+            min_atr = current_price * 0.005  # Minimum %0.5
+            if atr_val < min_atr:
+                atr_val = min_atr
+                self.gui.log(f"⚠️ {symbol}: ATR çok küçük, min. değer kullanılıyor: {atr_val:.6f}")
+            
+            if signal == "LONG":
+                order_side = "BUY"
+                close_side = "SELL"
+            else: 
+                order_side = "SELL"
+                close_side = "BUY"
+            
+            if tick_size <= 0:
+                tick_size = 0.01
+
+            try:
+                price_precision = max(2, min(8, int(round(-np.log10(tick_size), 0))))
+            except:
+                price_precision = 4
+
+            # SABİT STOP LOSS (Arayüzden gelen sl_pct ile)
+            sl_pct = self.gui.settings['sl_pct'] / 100
+            if signal == "LONG":
+                stop_loss_fixed = current_price * (1 - sl_pct)
+            else:  # SHORT
+                stop_loss_fixed = current_price * (1 + sl_pct)
+            
+            stop_loss_fixed = round(stop_loss_fixed, price_precision)
+
+            try:
+                # Pozisyon aç
+                self.client.new_order(symbol=symbol, side=order_side, type="MARKET", quantity=quantity)
+                self.gui.log(f"🚀 {symbol} {signal} AÇILDI. {quantity} adet @ {current_price} | ATR: {atr_val:.4f}", force=True)
+                
+                # Stop loss emri (SABİT - değişmedi)
+                if signal == "LONG":
+                    self.client.new_order(
+                        symbol=symbol, 
+                        side="SELL", 
+                        type="STOP_MARKET", 
+                        stopPrice=stop_loss_fixed, 
+                        closePosition="true"
+                    )
+                else:  # SHORT
+                    self.client.new_order(
+                        symbol=symbol, 
+                        side="BUY", 
+                        type="STOP_MARKET", 
+                        stopPrice=stop_loss_fixed, 
+                        closePosition="true"
+                    )
+                
+                self.gui.log(f"🛡️ {symbol} STOP LOSS: {stop_loss_fixed}", force=True)
+                
+                # ATR'yi trailing stop için kaydet - GÜNCELLENMİŞ
+                self.trailing_peaks[symbol] = {
+                    'atr': atr_val,
+                    'direction': signal,
+                    'entry_price': current_price,
+                    'peak_price': current_price,  # LONG için entry, SHORT için entry
+                    'initial_stop_loss': stop_loss_fixed,  # Sabit SL'i de kaydet
+                    'multiplier': 1.8  # Varsayılan multiplier
+                }
+    
+                self.gui.log(f"🎯 {symbol} Trailing Start: ATR={atr_val:.6f}, SL={stop_loss_fixed:.6f}")
+                
+            except Exception as sl_error:
+                self.gui.log(f"❌ {symbol} stop loss hatası: {sl_error}", force=True)
+            
+            self.touched_symbols.add(symbol)
+            self.total_trades_count += 1
+            
+        except Exception as e:
+            self.gui.log(f"❌ İşlem Hatası ({symbol}): {e}", force=True)
+    def close_all_positions(self):
+        """Tümünü kapatır - Geliştirilmiş versiyon"""
+        self.gui.log("⚠️ TÜM POZİSYONLAR İÇİN KAPATMA EMRİ VERİLİYOR...", force=True)
+        try:
+            all_positions = self.client.get_position_risk()
+            active_positions = [p for p in all_positions if float(p['positionAmt']) != 0]
+
+            if not active_positions:
+                self.gui.log("⚠️ Kapatılacak açık pozisyon yok.", force=True)
+                return
+
+            self.gui.log(f"🚀 {len(active_positions)} adet pozisyon sırayla kapatılıyor...", force=True)
+            
+            success_count = 0
+            error_count = 0
+            
+            # Her pozisyon için sırayla işlem yap (paralel değil)
+            for i, pos in enumerate(active_positions):
+                symbol = pos['symbol']
+                try:
+                    self.gui.log(f"📦 {i+1}/{len(active_positions)} {symbol} kapatılıyor...", force=False)
+                    self.close_single_position(symbol)
+                    success_count += 1
+                    
+                    # Her 5 işlemde bir 1 saniye bekle (rate limit koruması)
+                    if (i + 1) % 5 == 0:
+                        time.sleep(1)
+                        
+                except Exception as e:
+                    error_count += 1
+                    self.gui.log(f"❌ {symbol} kapatma hatası: {e}", force=True)
+                    continue
+
+            self.gui.log(f"✅ {success_count} pozisyon başarıyla kapatıldı, {error_count} hata", force=True)
+
+            time.sleep(0.5)
+            #self.previous_symbols.clear()    -- ekran temizleme
+            self.root.after(0, self.update_open_positions)
+        except Exception as e:
+            self.gui.log(f"❌ Toplu Kapatma Hatası: {e}", force=True)
+
+    def get_account_info(self):
+        if not self.client: return
+        try:
+            res = self.client.account()
+            for asset in res['assets']:
+                if asset['asset'] == 'USDT':
+                    self.current_balance = float(asset['walletBalance'])
+                    break
+            
+            if self.start_balance > 0:
+                self.bot_realized_pnl = self.current_balance - self.start_balance
+            else:
+                self.bot_realized_pnl = 0.0
+
+        except Exception as e:
+            pass
+
+    def update_open_positions(self):
+        if not self.client: return
+        try:
+            positions = self.client.get_position_risk()
+            active_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
+            self.total_position_value = sum(float(p['markPrice']) * abs(float(p['positionAmt'])) for p in active_positions)
+
+            def update_gui():
+                for widget in self.gui.scrollable_frame.winfo_children():
+                    widget.destroy()
+
+                if not active_positions:
+                    tk.Label(self.gui.scrollable_frame, text="Açık Pozisyon Bulunmuyor", bg="#2C3E50", fg="#BDC3C7", font=("Arial", 12, "bold")).pack(pady=20, anchor="center")
+                    return
+
+                for i, pos in enumerate(active_positions):
+                    symbol = pos['symbol']
+                    position_amt = float(pos['positionAmt'])
+                    side = "LONG" if position_amt > 0 else "SHORT"
+                    amount = abs(position_amt)
+                    entry_price = float(pos['entryPrice'])
+                    unrealized_pnl = float(pos['unRealizedProfit'])
+                    #liq_price = float(pos.get('liquidationPrice', 0)) or 0.0
+                    leverage = pos.get('leverage', 'N/A')
+
+                    pnl_color = "#2ECC71" if unrealized_pnl >= 0 else "#E74C3C"
+                    row_color = "#34495E" if i % 2 == 0 else "#2C3E50"
+
+                    row = tk.Frame(self.gui.scrollable_frame, bg=row_color, relief=tk.RIDGE, bd=1)
+                    row.pack(fill=tk.X, pady=2, padx=5)
+
+                    info_text = (f"{symbol:<12}|{side:<5} | Mik: {amount:>8.4f} | "
+                                 f"Gir: ${entry_price:>8.2f} | PNL:${unrealized_pnl:>8.2f} | "
+                                 f" | X: {leverage}")  # Liq: ${liq_price:>8.2f}  -- çıkardım
+                    
+                    tk.Label(row, text=info_text, font=("Consolas", 9), fg=pnl_color, bg=row_color, justify=tk.LEFT).pack(side=tk.LEFT, padx=10, pady=4)
+                    
+                    tk.Button(row, text="KAPAT", bg="#E74C3C", fg="white", font=("Arial", 8, "bold"),
+                              command=lambda s=symbol: self.close_single_position(s)).pack(side=tk.RIGHT, padx=10, pady=4)
+
+                if hasattr(self.gui, 'lbl_positions'):
+                    self.gui.lbl_positions.config(text=f"{len(active_positions)}")
+
+            self.root.after(0, update_gui)
+        except Exception: pass
+
+    def close_single_position(self, symbol):
+        def _action():
+            try:
+                positions = self.client.get_position_risk(symbol=symbol)
+                amt = 0.0
+                entry_price = 0.0
+                for p in positions:
+                    if float(p['positionAmt']) != 0:
+                        amt = float(p['positionAmt'])
+                        entry_price = float(p['entryPrice'])
+                        break
+                
+                if amt == 0:
+                    #self.safe_cancel_all_orders(symbol, reason="Temizlik")
+                    self.update_open_positions()
+                    return
+
+                side = "SELL" if amt > 0 else "BUY"
+                qty = abs(amt)
+                
+                response = self.client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly="true", recvWindow=30000)
+                
+                self.previous_symbols.discard(symbol) 
+                #self.safe_cancel_all_orders(symbol)
+
+                exit_price = float(response.get('avgPrice', 0))
+                if exit_price == 0:
+                    try:
+                        ticker = self.client.ticker_price(symbol)
+                        exit_price = float(ticker['price'])
+                    except:
+                        exit_price = entry_price
+
+                if amt > 0: realized_pnl = (exit_price - entry_price) * qty
+                else: realized_pnl = (entry_price - exit_price) * qty
+                
+                self.bot_realized_pnl += realized_pnl
+                if realized_pnl > 0: self.winning_trades += 1
+                else: self.losing_trades += 1
+                    
+                self.gui.log(f"✅ {symbol}... PNL: {realized_pnl:.2f} USDT", force=True)
+                self.safe_cancel_all_orders(symbol, reason=f"temizlik")
+                self.trailing_peaks.pop(symbol, None)
+
+                self.root.after(0, self.update_gui_stats)
+                time.sleep(1.0)
+                self.update_open_positions()
+                
+            except Exception as e:
+                self.gui.log(f"❌ Kapatma Hatası ({symbol}): {e}", force=True)
+        
+        threading.Thread(target=_action, daemon=True).start()
+
+    def update_gui_stats(self):
+        if not self.is_running: return
+        try:
+            if self.start_time:
+                elapsed = int(time.time() - self.start_time)
+                h, r = divmod(elapsed, 3600)
+                m, s = divmod(r, 60)
+                self.gui.lbl_runtime.config(text=f"{h:02d}:{m:02d}:{s:02d}")
+
+            self.gui.lbl_balance.config(text=f"{self.current_balance:.2f} $")
+            self.gui.lbl_bot_pnl.config(text=f"{self.bot_realized_pnl:+.2f} $")
+            self.gui.lbl_trade_count.config(text=str(self.total_trades_count))
+            self.gui.lbl_total_pos_value.config(text=f"{self.total_position_value:.2f} $")
+            self.gui.lbl_stats.config(text=f"{self.winning_trades} / {self.losing_trades}")
+            self.gui.last_update_label.config(text=f"Son Güncelleme: {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+        except Exception as e:
+            print(f"GUI Stat Error: {e}")
+        
+        finally:
+            self.root.after(1000, self.update_gui_stats)
+        
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AllyGatorLogic(root)
+    def on_closing():
+        if app.is_running: app.stop_bot_monitor()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
+
+
+*********************gui.py*************************
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import threading
+import time
+import datetime
+import requests 
+
+class BotGUI:
+    
+    def __init__(self, root, start_callback=None, stop_callback=None, toggle_trading_callback=None, close_all_callback=None, emergency_stop_callback=None):
+        self.root = root
+        self.root.title("AllyGator v0.2")
+        self.root.configure(bg="#1E2A38")
+        
+        # --- Callback Fonksiyonları ---
+        self.start_callback = start_callback
+        self.stop_callback = stop_callback
+        self.toggle_trading_callback = toggle_trading_callback
+        # Yeni eklenen callbackleri içeri alıyoruz
+        self.close_all_callback = close_all_callback
+        self.emergency_stop_callback = emergency_stop_callback
+        # UI Değişkenleri
+        self.is_running = False 
+        self.trading_active = False
+        self.mode_var = tk.IntVar(value=1)
+        self.tg_var = tk.IntVar(value=0)
+        
+        # Kontrol Anahtarları
+        self.rsi_check_var = tk.IntVar(value=1)
+        self.boll_check_var = tk.IntVar(value=1)
+        self.sentiment_var = tk.IntVar(value=0)
+        self.isolated_var = tk.IntVar(value=0)
+        
+        # Giriş Widgetlarını Saklayacağımız Sözlük (Ayarların anlık okunması için)
+        self.entry_widgets = {}
+
+        # Varsayılan Ayarlar
+        self.settings = {
+            'min_volume': 400, 'budget_pct': 1, 'sl_pct': 4.0, 'tp_pct': 1.0, 
+            'min_rsi': 35, 'max_rsi': 65, 'funding_max': 0.1, 'score_thresh': 14
+        }
+
+        # İstatistikler
+        self.bot_realized_pnl = 0.0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        
+        self.setup_gui()
+        self.log("Bot başlatıldı.", force=True)
+        self.toggle_mode_display()
+
+    def setup_gui(self):
+        self.root.state('zoomed')
+        self.root.minsize(1000, 400)
+        
+        # Başlık
+        header = tk.Frame(self.root, bg="#1E2A38")
+        header.pack(fill=tk.X, padx=5, pady=2)
+        tk.Label(header, text="AllyGator v0.2", font=("Arial", 16, "bold"), fg="#00D8FF", bg="#1E2A38").pack(pady=5)
+
+        # Ana Panel
+        main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg="#1E2A38", sashrelief=tk.RAISED, sashwidth=4)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # SOL PANEL
+        left_outer = tk.Frame(main_pane, bg="#2C3E50")
+        main_pane.add(left_outer, minsize=500)
+        
+        left_canvas = tk.Canvas(left_outer, bg="#2C3E50", highlightthickness=0)
+        scrollbar_left = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        self.left_scrollable_frame = tk.Frame(left_canvas, bg="#2C3E50")
+        
+        self.left_scrollable_frame.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        
+        left_canvas.create_window((0, 0), window=self.left_scrollable_frame, anchor="nw", width=480)
+        left_canvas.configure(yscrollcommand=scrollbar_left.set)
+        left_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar_left.pack(side="right", fill="y")
+
+        # 1. HESAP ÖZETİ
+        self.create_section_header(self.left_scrollable_frame, "KONTROL MERKEZİ")
+        account_info = tk.Frame(self.left_scrollable_frame, bg="#2C3E50")
+        account_info.pack(fill=tk.X, padx=5, pady=5)
+        account_info.grid_columnconfigure((0,1), weight=1)
+
+        self.lbl_balance = self.add_info_row(account_info, 0, 0, "Toplam Bakiye:", "-- $", "#2ECC71") 
+        self.lbl_positions = self.add_info_row(account_info, 0, 1, "Açık Pozisyon:", "0", "#E67E22")
+        self.lbl_total_pos_value = self.add_info_row(account_info, 1, 0, "Toplam İşlem Değeri:", "-- $", "#9B59B6") 
+        self.lbl_pnl = self.add_info_row(account_info, 1, 1, "Günlük PNL:", "-- $", "#1ABC9C")
+        self.lbl_bot_pnl = self.add_info_row(account_info, 2, 0, "Bot PNL:", "+0.00", "#2ECC71") 
+        self.lbl_trade_count = self.add_info_row(account_info, 2, 1, "İşlem Sayısı :", "0", "#3498DB") 
+        self.lbl_stats = self.add_info_row(account_info, 3, 0, "Kazanan / Kaybeden:", "0 / 0", "#E67E22") 
+        self.lbl_runtime = self.add_info_row(account_info, 3, 1, "Çalışma Süresi:", "00:00", "#3498DB")
+
+        # 2. KONTROL MERKEZİ
+        self.create_section_header(self.left_scrollable_frame, " ") #, "KONTROL MERKEZİ")
+        mode_frame = tk.Frame(self.left_scrollable_frame, bg="#2C3E50")
+        mode_frame.pack(fill=tk.X, pady=5)
+        
+        self.mode_label = tk.Label(mode_frame, text="MOD: TESTNET (Güvenli)", font=("Arial", 12, "bold"), fg="#2ECC71", bg="#2C3E50")
+        self.mode_label.pack(pady=5)
+        
+        chk_frame = tk.Frame(mode_frame, bg="#2C3E50")
+        chk_frame.pack(pady=5)
+        tk.Checkbutton(chk_frame, text="Testnet Kullan", variable=self.mode_var, command=self.toggle_mode_display, bg="#2C3E50", fg="white", selectcolor="#2C3E50", activebackground="#2C3E50").pack(side=tk.LEFT, padx=10)
+        tk.Checkbutton(chk_frame, text="Telegram Aktif", variable=self.tg_var, bg="#2C3E50", fg="#00D8FF", selectcolor="#2C3E50", activebackground="#2C3E50").pack(side=tk.LEFT, padx=10)
+
+        # Butonlar
+        btn_frame = tk.Frame(self.left_scrollable_frame, bg="#2C3E50")
+        btn_frame.pack(fill=tk.X, pady=10, padx=5)
+        
+        self.btn_start = tk.Button(btn_frame, text="▶️ BAŞLAT", bg="#2980B9", fg="#F9FBFC", font=("Arial", 9), height=1, command=self.on_start_press)
+        self.btn_start.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+        self.btn_stop = tk.Button(btn_frame, text="⏹️ DURDUR", bg="#E74C3C", fg="white", font=("Arial", 9), height=1, state=tk.DISABLED, command=self.on_stop_press)
+        self.btn_stop.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+        self.btn_alim_ac = tk.Button(btn_frame, text="🟢 ALIM AÇ", bg="#27AE60", fg="white", font=("Arial", 9), height=1, state=tk.DISABLED, command=self.toggle_trading_ui)
+        self.btn_alim_ac.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+        self.btn_alim_kapa = tk.Button(btn_frame, text="🔴 ALIM KAPA", bg="#E74C3C", fg="white", font=("Arial", 9), height=1, state=tk.DISABLED, command=self.toggle_trading_ui)
+        self.btn_alim_kapa.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
+        
+        # Acil Durum Butonları
+        # Acil Durum Butonları
+        emergency_frame = tk.Frame(self.left_scrollable_frame, bg="#2C3E50")
+        emergency_frame.pack(fill=tk.X, pady=5, padx=5)
+        emergency_frame.grid_columnconfigure((0, 1), weight=1)
+        
+        # self.close_all_callback varsa onu kullan, yoksa boş geç
+        cmd_close = self.close_all_callback if self.close_all_callback else None
+        self.btn_close_all = tk.Button(emergency_frame, text="❌ TÜM POZİSYONLARI KAPAT", bg="#F39C12", fg="#F4F5F0", width=20, command=cmd_close, font=("Arial", 9))
+        self.btn_close_all.grid(row=0, column=0, padx=2, pady=2, sticky="ew")
+        
+        # self.emergency_stop_callback varsa onu kullan
+        cmd_emergency = self.emergency_stop_callback if self.emergency_stop_callback else None
+        self.btn_emergency = tk.Button(emergency_frame, text="🛑 ACİL DURDUR", bg="#C0392B", fg="white", width=20, command=cmd_emergency, font=("Arial", 9))
+        self.btn_emergency.grid(row=0, column=1, padx=2, pady=2, sticky="ew")
+
+        # 3. STRATEJİ KRİTERLERİ
+        self.create_section_header(self.left_scrollable_frame, " ") #, "STRATEJİ KRİTERLERİ")
+        settings_grid = tk.Frame(self.left_scrollable_frame, bg="#2C3E50")
+        settings_grid.pack(padx=5, pady=5)
+
+        numerical_labels = ["Min Hacim (M)", "Bütçe (%)", "SL %", "ATR-TP %", "Min RSI", "Max RSI", "Funding Max", "Puan Eşiği"]
+        numerical_keys = ['min_volume', 'budget_pct', 'sl_pct', 'tp_pct', 'min_rsi', 'max_rsi', 'funding_max', 'score_thresh']
+        
+        for i, (txt, key) in enumerate(zip(numerical_labels, numerical_keys)):
+            r, c = divmod(i, 4)
+            tk.Label(settings_grid, text=txt, bg="#2C3E50", fg="#BDC3C7", font=("Arial", 10)).grid(row=r*2, column=c, padx=5, pady=2)
+            entry = tk.Entry(settings_grid, width=8, bg="#34495E", fg="#F4F5F0", insertbackground="white")
+            entry.insert(0, str(self.settings.get(key, "")))
+            entry.grid(row=r*2+1, column=c, padx=5, pady=(2,5) ) #pady=(0, 10))
+            
+            # --- DEĞİŞİKLİK: Widget'ı sakla ki main.py doğrudan okuyabilsin ---
+            self.entry_widgets[key] = entry 
+            entry.bind('<FocusOut>', lambda e, k=key, ent=entry: self.update_setting(k, ent))
+
+        # Checkboxlar
+        check_boxes = [("RSI Kontrolü", self.rsi_check_var), ("BOLL Kriteri", self.boll_check_var), ("Yerel AI Aç/Kapa", self.sentiment_var), ("Isolated Mod", self.isolated_var)]
+        check_frame = tk.Frame(settings_grid, bg="#2C3E50")
+        check_frame.grid(row=4, column=0, columnspan=4, pady=10)
+        for i, (txt, var) in enumerate(check_boxes):
+            tk.Checkbutton(check_frame, text=txt, variable=var, bg="#2C3E50", fg="white", selectcolor="#2C3E50", activebackground="#2C3E50").pack(side=tk.LEFT, padx=5)
+
+        # SAĞ PANEL (Aynı kaldı)
+        right_pane = tk.PanedWindow(main_pane, orient=tk.VERTICAL, bg="#1E2A38", sashrelief=tk.RAISED, sashwidth=4)
+        main_pane.add(right_pane, minsize=500)
+
+        positions_frame = tk.Frame(right_pane, bg="#2C3E50")
+        right_pane.add(positions_frame, minsize=300)
+        tk.Label(positions_frame, text="AÇIK POZİSYONLAR", font=("Arial", 12, "bold"), fg="#00D8FF", bg="#2C3E50").pack(pady=5)
+        
+        pos_container = tk.Frame(positions_frame, bg="#2C3E50")
+        pos_container.pack(fill=tk.BOTH, padx=10, pady=5)  #, expand=True
+        canvas = tk.Canvas(pos_container, bg="#2C3E50", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(pos_container, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = tk.Frame(canvas, bg="#2C3E50")
+        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        log_frame = tk.Frame(right_pane, bg="#2C3E50")
+        right_pane.add(log_frame, minsize=200)
+        tk.Label(log_frame, text="SİSTEM LOGLARI", font=("Arial", 11, "bold"), fg="#00D8FF", bg="#2C3E50").pack(pady=2)
+        self.log_text = scrolledtext.ScrolledText(log_frame, bg="#1C2833", fg="#2ECC71", font=("Consolas", 10), height=10)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        status_frame = tk.Frame(self.root, bg="#2C3E50")
+        status_frame.pack(fill=tk.X, padx=5, pady=2)
+        self.status_label = tk.Label(status_frame, text="🟢 Sistem Hazır - Beklemede", font=("Arial", 9), fg="white", bg="#2C3E50")
+        self.status_label.pack(side=tk.LEFT, expand=True, anchor="w")
+        self.last_update_label = tk.Label(status_frame, text="Son Güncelleme: --", font=("Arial", 9), fg="#BDC3C7", bg="#2C3E50")
+        self.last_update_label.pack(side=tk.RIGHT, padx=10)
+
+    # --- YARDIMCI METOD: GÜNCEL AYARLARI ZORLA OKU ---
+    def get_latest_settings_from_ui(self):
+        """Kutucuklarda ne yazıyorsa anında onu okur, FocusOut beklemez."""
+        for key, widget in self.entry_widgets.items():
+            try:
+                val = float(widget.get())
+                self.settings[key] = val
+            except ValueError:
+                pass # Boşsa veya hatalıysa eski değeri koru
+        return self.settings
+
+    def create_section_header(self, parent, text):
+        tk.Label(parent, text=text, font=("Arial", 12, "bold"), fg="#00D8FF", bg="#2C3E50").pack(pady=(5, 5))
+
+    def add_info_row(self, parent, r, c, title, val, color):
+        frame = tk.Frame(parent, bg="#2C3E50")
+        frame.grid(row=r, column=c, sticky="ew", padx=5, pady=2)
+        tk.Label(frame, text=title, font=("Arial", 11), fg="#BDC3C7", bg="#2C3E50", anchor="w").pack(side=tk.LEFT)
+        val_lbl = tk.Label(frame, text=val, font=("Arial", 11, "bold"), fg=color, bg="#2C3E50", anchor="e")
+        val_lbl.pack(side=tk.RIGHT)
+        return val_lbl
+
+    def update_setting(self, key, entry_widget):
+        try:
+            val = float(entry_widget.get())
+            self.settings[key] = val
+        except ValueError:
+            self.log(f"HATA: {key} geçersiz!", force=True)
+
+    def toggle_mode_display(self):
+        if self.mode_var.get() == 1:
+            self.mode_label.config(text="MOD: TESTNET (Güvenli)", fg="#2ECC71")
+        else:
+            self.mode_label.config(text="MOD: GERÇEK (Mainnet)", fg="#E74C3C")
+
+    # Aksiyonlar
+    def on_start_press(self):
+        self.is_running = True
+        self.btn_start.config(state=tk.DISABLED, bg="#145A32")
+        self.btn_stop.config(state=tk.NORMAL, bg="#E74C3C")
+        self.btn_alim_ac.config(state=tk.NORMAL, bg="#27AE60")
+        self.btn_alim_kapa.config(state=tk.DISABLED, bg="#E74C3C") 
+        leverage_mode = "Isolated" if self.isolated_var.get() == 1 else "Cross (Varsayılan)"
+        self.log(f"Bot başlatılıyor. Mod: {'TESTNET' if self.mode_var.get() == 1 else 'MAİN NET'}. Kaldıraç: {leverage_mode}", force=True)
+        self.status_label.config(text="🟡 Bot Çalışıyor - Alım Modu: Kapalı")
+        if self.start_callback: threading.Thread(target=self.start_callback, daemon=True).start()
+
+    def on_stop_press(self):
+        self.is_running = False
+        self.trading_active = False
+        self.btn_start.config(state=tk.NORMAL, bg="#2980B9")
+        self.btn_stop.config(state=tk.DISABLED, bg="#922B21")
+        self.btn_alim_ac.config(text="🟢 ALIM AÇ", bg="#27AE60", state=tk.DISABLED)
+        self.btn_alim_kapa.config(state=tk.DISABLED, bg="#E74C3C")
+        self.log("🛑 Bot durduruldu.", force=True)
+        self.status_label.config(text="🔴 Bot Durduruldu - Sistem Pasif")
+        if self.stop_callback: self.stop_callback()
+
+    def toggle_trading_ui(self):
+        if self.btn_alim_ac['state'] == tk.NORMAL:
+            self.trading_active = True
+            self.btn_alim_ac.config(state=tk.DISABLED, bg="#145A32")
+            self.btn_alim_kapa.config(state=tk.NORMAL, bg="#E74C3C")
+            self.log("✅ ALIM MODU AÇIK: Sinyal Tarama Başladı.", force=True)
+            self.status_label.config(text="🟢 Bot Çalışıyor - Alım Modu: Açık")
+        elif self.btn_alim_kapa['state'] == tk.NORMAL:
+            self.trading_active = False
+            self.btn_alim_ac.config(state=tk.NORMAL, bg="#27AE60")
+            self.btn_alim_kapa.config(state=tk.DISABLED, bg="#922B21")
+            self.log("🛑 ALIM MODU KAPALI: Tarama Durduruldu.", force=True)
+            self.status_label.config(text="🟡 Bot Çalışıyor - Alım Modu: Kapalı")
+        if self.toggle_trading_callback: self.toggle_trading_callback(self.trading_active)
+
+    def close_all_positions_ui(self):
+        self.log("⚠️ BUTONA BASILDI (Fonksiyon Bağlanmadı!)", force=True)
+
+    def emergency_stop_ui(self):
+        self.log("🛑 ACİL DURDURMA!", force=True)
+        self.trading_active = False
+        self.on_stop_press()
+        self.close_all_positions_ui() # Bunu da çağır
+
+    def log(self, message, force=False):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{timestamp}] {message}\n"
+        def _write():
+            self.log_text.insert(tk.END, full_msg)
+            self.log_text.see(tk.END)
+        if threading.current_thread() is threading.main_thread(): _write()
+        else: self.root.after(0, _write)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BotGUI(root)
+    root.mainloop()
+
+
+******************************score.py************************************
+
+
+import pandas as pd
+import ta.momentum
+import ta.volatility
+import ta.trend
+import numpy as np
+
+# Kendi modüllerimizi dahil ediyoruz
+from strategies.fvg import detect_fvg, check_fvg_signal, detect_fvg_fill
+from strategies.structure import detect_structure, check_trend
+
+
+class SignalEngine:
+    def __init__(self, settings=None, log_func=None):
+        # Log fonksiyonu varsa onu kullan, yoksa boş print yap
+        self.settings = settings or {}   # GUI tarafından geçilecek
+        self.log = log_func if log_func else print
+        
+        # Puan Ağırlıkları (İstediğin gibi değiştirebilirsin)
+        self.weights = {
+            'fvg': 4,              # FVG Ana Sinyal
+            'structure': 3,        # Trend
+            'rsi_boll': 2,         # Filtre
+            'liquidity': 3,        # Likidite analizi
+            'volume_profile': 2,   # Hacim profili
+            'order_block': 3,      # Order block
+            'order_flow': 3,       # CVD ve delta
+            'pd_arrays': 2,        # Premium/Discount
+            'ote': 3,              # Fibonacci OTE
+            'killzones': 1,        # Zaman bazlı
+            'ml': 2,               # Makine öğrenmesi
+            'threshold':20     # Minimum puan (arayüzden)
+        }
+    @property
+    def threshold(self):
+        # settings içinde yoksa weights'den al
+        try:
+            return int(self.settings.get('score_thresh', self.weights['threshold']))
+        except Exception as e:
+            self.log(f"SignalEngine.threshold okuma hatası: {e} → varsayılan döndürülüyor")
+            return int(self.weights['threshold'])
+
+    def update_settings(self, new_settings):
+        """Main thread GUI güncellendiğinde bu metodu çağır."""
+
+        if not isinstance(new_settings, dict):
+            self.log(f"update_settings: new_settings dict değil ({type(new_settings)}) - gözardı ediliyor.")
+            return
+
+        self.settings = new_settings
+    def calculate_indicators(self, df):
+        """Yardımcı indikatörleri hesapla (RSI, Bollinger)"""
+        df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+        bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
+        df['bb_upper'] = bb.bollinger_hband()
+        df['bb_lower'] = bb.bollinger_lband()
+        return df
+    
+    def get_higher_timeframe_data(self, symbol, client, interval='1d', limit=100):
+        """Yüksek timeframe verisi çeker"""
+        try:
+            klines = client.klines(symbol, interval, limit=limit)
+            df = pd.DataFrame(klines, columns=[
+                'Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 
+                'Close time', 'Quote asset volume', 'Number of trades', 
+                'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'
+            ])
+            cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            df[cols] = df[cols].astype(float)
+            return self.calculate_indicators(df)
+        except Exception as e:
+            self.log(f"Yüksek TF veri hatası ({symbol}): {e}")
+            return None
+
+    # --- MODÜL 1: Trend Analizi ---
+    def _module_structure(self, df):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        # Lookback 5 (Senin istediğin gibi)
+        df_struct = detect_structure(df, lookback=5)
+        trend, is_bos = check_trend(df_struct)
+        
+        if trend == "BULLISH":
+            l_score += self.weights['structure']
+            if is_bos: 
+                l_score += 1
+                reason = "Trend Bullish + BOS"
+            else:
+                reason = "Trend Bullish"
+                
+        elif trend == "BEARISH":
+            s_score += self.weights['structure']
+            if is_bos: 
+                s_score += 1
+                reason = "Trend Bearish + BOS"
+            else:
+                reason = "Trend Bearish"
+                
+        return l_score, s_score, reason
+
+    # --- MODÜL 2: FVG (Price Action) ---
+    def _module_fvg(self, df):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        fvg_bull, fvg_bear = detect_fvg(df)
+        fvg_bull = detect_fvg_fill(df, fvg_bull)
+        fvg_bear = detect_fvg_fill(df, fvg_bear)
+        
+        # Sinyal kontrolü
+        raw_signal = check_fvg_signal(df, fvg_bull, fvg_bear)
+        
+        if raw_signal > 0:
+            l_score += self.weights['fvg']
+            reason = "Bullish FVG Bölgesi"
+        elif raw_signal < 0:
+            s_score += self.weights['fvg']
+            reason = "Bearish FVG Bölgesi"
+            
+        return l_score, s_score, reason
+
+    # --- MODÜL 3: RSI & Bollinger (Filtre) ---
+    def _module_rsi_bollinger(self, df):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        current_price = df['Close'].iloc[-1]
+        rsi = df['rsi'].iloc[-1]
+        bb_lower = df['bb_lower'].iloc[-1]
+        bb_upper = df['bb_upper'].iloc[-1]
+        
+        # AND Mantığı: Hem RSI düşük olacak HEM Fiyat Bollinger altında olacak
+        if rsi < 35 and current_price < bb_lower:
+            l_score += self.weights['rsi_boll']
+            reason = "RSI<35 & BB Altı"
+            
+        # AND Mantığı: Hem RSI yüksek olacak HEM Fiyat Bollinger üstünde olacak
+        elif rsi > 70 and current_price > bb_upper:
+            s_score += self.weights['rsi_boll']
+            reason = "RSI>65 & BB Üstü"
+            
+        return l_score, s_score, reason
+    
+    # --- YENİ MODÜL 4: Likidite Analizi ---
+    def _module_liquidity(self, df, window=20):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            # 1. Alt/Üst wick oranı analizi
+            df['body'] = abs(df['Close'] - df['Open'])
+            df['range'] = df['High'] - df['Low']
+            df['lower_wick_ratio'] = (df['Open'] - df['Low']) / (df['range'] + 1e-8)
+            df['upper_wick_ratio'] = (df['High'] - df['Open']) / (df['range'] + 1e-8)
+            
+            # Son 5 mumda strong lower wick + hacim spike
+            current_lower_wick = df['lower_wick_ratio'].iloc[-1]
+            current_volume = df['Volume'].iloc[-1]
+            avg_volume = df['Volume'].tail(5).mean()
+            
+            if current_lower_wick > 0.6 and current_volume > avg_volume * 1.8:
+                l_score += self.weights['liquidity']
+                reason += "Lower Wick Hunt | "
+            
+            # Son 5 mumda strong upper wick + hacim spike  
+            current_upper_wick = df['upper_wick_ratio'].iloc[-1]
+            if current_upper_wick > 0.6 and current_volume > avg_volume * 1.8:
+                s_score += self.weights['liquidity']
+                reason += "Upper Wick Hunt | "
+                
+            # 2. Eşit düşükler/tepelere yakınlık (likidite bölgeleri)
+            current_low = df['Low'].iloc[-1]
+            current_high = df['High'].iloc[-1]
+            
+            # Son 50 mumda eşit düşükler
+            recent_lows = df['Low'].tail(50)
+            equal_lows = recent_lows[abs(recent_lows - recent_lows.shift(1)) < recent_lows * 0.001]
+            if len(equal_lows) >= 2:
+                liquidity_zone = equal_lows.min()
+                if abs(current_low - liquidity_zone) / liquidity_zone < 0.002:  # %0.2 yakınsa
+                    l_score += 2
+                    reason += "Equal Lows Zone | "
+                return l_score, s_score, reason
+            
+            # Son 50 mumda eşit yüksekler
+            recent_highs = df['High'].tail(50)
+            equal_highs = recent_highs[abs(recent_highs - recent_highs.shift(1)) < recent_highs * 0.001]
+            if len(equal_highs) >= 2:
+                liquidity_zone = equal_highs.max()
+                if abs(current_high - liquidity_zone) / liquidity_zone < 0.002:
+                    s_score += 2
+                    reason += "Equal Highs Zone | "
+
+                return l_score, s_score, reason
+                    
+        except Exception as e:
+            self.log(f"Likidite modülü hatası: {e}")
+    
+    # --- YENİ MODÜL 5: Hacim Profili ve POC ---
+    def _module_volume_profile(self, df, period=50):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            if len(df) < period:
+                return l_score, s_score, "Yetersiz veri"
+                
+            # Basit hacim profili hesaplama
+            recent_df = df.tail(period)
+            price_min, price_max = recent_df['Low'].min(), recent_df['High'].max()
+            
+            # 20 fiyat seviyesine böl
+            bins = np.linspace(price_min, price_max, 20)
+            volume_profile = np.zeros(len(bins)-1)
+            
+            for i in range(len(recent_df)):
+                close_price = recent_df['Close'].iloc[i]
+                volume_val = recent_df['Volume'].iloc[i]
+                
+                # Hangi bine denk geliyor
+                bin_idx = np.digitize(close_price, bins) - 1
+                if 0 <= bin_idx < len(volume_profile):
+                    volume_profile[bin_idx] += volume_val
+            
+            # POC (Point of Control) bul
+            poc_idx = np.argmax(volume_profile)
+            poc_price = bins[poc_idx]
+            
+            current_price = df['Close'].iloc[-1]
+            
+            # POC'a göre bias
+            if current_price < poc_price * 0.99:  # POC'un %1 altında
+                l_score += self.weights['volume_profile']
+                reason += f"Price Below POC | "
+            elif current_price > poc_price * 1.01:  # POC'un %1 üstünde
+                s_score += self.weights['volume_profile']
+                reason += f"Price Above POC | "
+                
+        except Exception as e:
+            self.log(f"Hacim profili modülü hatası: {e}")
+            
+        return l_score, s_score, reason
+
+    # --- YENİ MODÜL 6: Order Block Tespiti ---
+    def _module_order_blocks(self, df, lookback=50):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            current_idx = len(df) - 1
+            current_price = df['Close'].iloc[-1]
+            
+            # Son bearish mumdan önceki güçlü bullish mum (Bullish OB)
+            for i in range(current_idx - 2, max(0, current_idx - lookback), -1):
+                if (df['Close'].iloc[i-2] < df['Open'].iloc[i-2] and  # Önceki mum bearish
+                    df['Close'].iloc[i-1] > df['Open'].iloc[i-1] and  # Şimdiki mum bullish
+                    (df['Close'].iloc[i-1] - df['Open'].iloc[i-1]) > 2 * abs(df['Open'].iloc[i-2] - df['Close'].iloc[i-2])):
+                    
+                    ob_low = df['Low'].iloc[i-1]
+                    ob_high = df['High'].iloc[i-1]
+                    
+                    # Fiyat bu bölgeye yakınsa
+                    if ob_low <= current_price <= ob_high * 1.01:
+                        l_score += self.weights['order_block']
+                        reason += "Bullish OB Zone | "
+                        break
+            
+            # Son bullish mumdan önceki güçlü bearish mum (Bearish OB)  
+            for i in range(current_idx - 2, max(0, current_idx - lookback), -1):
+                if (df['Close'].iloc[i-2] > df['Open'].iloc[i-2] and  # Önceki mum bullish
+                    df['Close'].iloc[i-1] < df['Open'].iloc[i-1] and  # Şimdiki mum bearish
+                    abs(df['Open'].iloc[i-1] - df['Close'].iloc[i-1]) > 2 * (df['Close'].iloc[i-2] - df['Open'].iloc[i-2])):
+                    
+                    ob_low = df['Low'].iloc[i-1]
+                    ob_high = df['High'].iloc[i-1]
+                    
+                    # Fiyat bu bölgeye yakınsa
+                    if ob_low * 0.99 <= current_price <= ob_high:
+                        s_score += self.weights['order_block']
+                        reason += "Bearish OB Zone | "
+                        break
+                        
+        except Exception as e:
+            self.log(f"Order block modülü hatası: {e}")
+            
+        return l_score, s_score, reason
+
+    # --- YENİ MODÜL 7: PD Arrays (Premium/Discount) ---
+    def _module_pd_arrays(self, df):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            if len(df) < 20:
+                return l_score, s_score, "Yetersiz veri"
+            
+            # Basit PD Arrays implementasyonu
+            weekly_high = df['High'].tail(100).max()
+            weekly_low = df['Low'].tail(100).min()
+            equilibrium = (weekly_high + weekly_low) / 2
+            
+            premium = weekly_high - (weekly_high - equilibrium) * 0.25
+            discount = weekly_low + (equilibrium - weekly_low) * 0.25
+            
+            current_price = df['Close'].iloc[-1]
+            
+            if current_price < discount:
+                l_score += self.weights['pd_arrays']
+                reason += "Discount Zone | "
+            elif current_price > premium:
+                s_score += self.weights['pd_arrays'] 
+                reason += "Premium Zone | "
+                
+        except Exception as e:
+            self.log(f"PD Arrays modülü hatası: {e}")
+            
+        return l_score, s_score, reason
+
+    # --- YENİ MODÜL 8: OTE (Optimal Trade Entry) Fibonacci ---
+    def _module_ote(self, df, swing_period=30):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            if len(df) < swing_period + 5:
+                return l_score, s_score, "Yetersiz veri"
+            
+            # Son swing high/low bul
+            recent_high = df['High'].tail(swing_period).max()
+            recent_low = df['Low'].tail(swing_period).min()
+            
+            fib_618 = recent_high - (recent_high - recent_low) * 0.618
+            fib_786 = recent_high - (recent_high - recent_low) * 0.786
+            
+            current_price = df['Close'].iloc[-1]
+            
+            # Fiyat OTE bölgesinde mi (fib 0.618-0.786)
+            if fib_786 <= current_price <= fib_618:
+                # FVG ile kombine et (basit versiyon)
+                fvg_bullish, fvg_bearish = detect_fvg(df)
+                fvg_bullish = detect_fvg_fill(df, fvg_bullish)
+                
+                for fvg in fvg_bullish[-3:]:  # Son 3 FVG'yi kontrol et
+                    if not fvg.get('filled', True) and abs(current_price - fvg['avg_price']) / current_price < 0.005:
+                        l_score += self.weights['ote']
+                        reason += "OTE + FVG | "
+                        break
+                        
+        except Exception as e:
+            self.log(f"OTE modülü hatası: {e}")
+            
+        return l_score, s_score, reason
+
+    # --- YENİ MODÜL 9: Kill Zones (Zaman Bazlı) ---
+    def _module_killzones(self):
+        l_score, s_score = 0, 0
+        reason = ""
+        
+        try:
+            from datetime import datetime
+            utc_hour = datetime.utcnow().hour
+            
+            # London Open (08:00-10:00 UTC) ve New York Open (13:30-16:00 UTC)
+            if (8 <= utc_hour < 10) or (13.5 <= utc_hour < 16):
+                l_score += self.weights['killzones']
+                s_score += self.weights['killzones']  # Her iki yöne de puan
+                reason += "Kill Zone Active | "
+                
+        except Exception as e:
+            self.log(f"Kill zones modülü hatası: {e}")
+            
+        return l_score, s_score, reason
+
+
+    # --- ANA PUANLAMA FONKSİYONU ---
+    def get_composite_score(self, df, symbol=None, client=None):
+        try:
+            if len(df) < 50: return "HOLD", 0, "Yetersiz Veri"
+            
+            
+            if not isinstance(self.settings, dict):
+                try:
+                    self.settings = dict(self.settings)  # Dönüştürmeye çalış
+                except Exception:
+                    self.settings = {}  # Başarısız olursa boş
+                    self.log("DEBUG: settings could not be converted to dict → using empty")
+
+
+
+            
+            df = self.calculate_indicators(df)
+        
+            
+            total_long_score = 0
+            total_short_score = 0
+            
+            # Raporlama için detaylar
+            reasons_log = []
+
+            # --- PARALEL MODÜL ÇAĞRILARI ---
+            # Burası tam istediğin modüler yapı. İleride 4. modülü buraya ekle yeter.
+            
+            # 1. Structure
+            l1, s1, r1 = self._module_structure(df)
+            total_long_score += l1
+            total_short_score += s1
+            if r1: reasons_log.append(f"[Yapı: {r1}]")
+            
+            # 2. FVG
+            l2, s2, r2 = self._module_fvg(df)
+            total_long_score += l2
+            total_short_score += s2
+            if r2: reasons_log.append(f"[FVG: {r2}]")
+            
+            # 3. RSI & Bollinger
+            l3, s3, r3 = self._module_rsi_bollinger(df)
+            total_long_score += l3
+            total_short_score += s3
+            if r3: reasons_log.append(f"[İndikatör: {r3}]")
+
+            # YENİ MODÜLLER
+            l4, s4, r4 = self._module_liquidity(df)
+            total_long_score += l4
+            total_short_score += s4
+            if r4: reasons_log.append(f"[Likidite: {r4}]")
+
+            l5, s5, r5 = self._module_volume_profile(df)
+            total_long_score += l5
+            total_short_score += s5
+            if r5: reasons_log.append(f"[Hacim: {r5}]")
+
+            l6, s6, r6 = self._module_order_blocks(df)
+            total_long_score += l6
+            total_short_score += s6
+            if r6: reasons_log.append(f"[OB: {r6}]")
+
+            l7, s7, r7 = self._module_pd_arrays(df)
+            total_long_score += l7
+            total_short_score += s7
+            if r7: reasons_log.append(f"[PD: {r7}]")
+
+            l8, s8, r8 = self._module_ote(df)
+            total_long_score += l8
+            total_short_score += s8
+            if r8: reasons_log.append(f"[OTE: {r8}]")
+
+            l9, s9, r9 = self._module_killzones()
+            total_long_score += l9
+            total_short_score += s9
+            if r9: reasons_log.append(f"[Zaman: {r9}]")
+            
+            # --- KARAR ANI ---
+            threshold = self.threshold
+            final_signal = "HOLD"
+            final_reason = " | ".join(reasons_log)
+            
+            # Sadece bir taraf eşiği geçerse sinyal ver
+            # Eğer ikisi de yüksekse (kararsızlık) HOLD kalır veya puanı çok yüksek olanı seçeriz.
+            if total_long_score >= threshold and total_long_score > total_short_score:
+                final_signal = "LONG"
+                #self.log(f"🧩 LONG Sinyali: Puan {total_long_score} Detay: {final_reason}")
+                
+                # -> DÖNÜŞ EKLENDİ
+                return final_signal, total_long_score, final_reason
+
+            elif total_short_score >= threshold and total_short_score > total_long_score:
+                final_signal = "SHORT"
+                #self.log(f"🧩 SHORT Sinyali: Puan {total_short_score} Detay: {final_reason}")
+                
+                # -> DÖNÜŞ EKLENDİ
+                return final_signal, total_short_score, final_reason
+
+            else:
+                return "HOLD", 0, final_reason
+        
+        except Exception as e:
+            self.log(f"❌ get_composite_score hatası: {e}")
+            # HATA DURUMUNDA DA 3 DEĞER DÖNDÜR
+            return "HOLD", 0, f"Hata: {str(e)}"
+
+
+
+**************************** strategy.py***************************
+
+
+import pandas as pd
+import time
+# Yeni beyin takımını import ediyoruz
+from strategies.score import SignalEngine
+
+class StrategyCore:
+    def __init__(self, api_client, settings, log_func):
+        self.client = api_client
+        self.settings = settings
+        self.log = log_func
+        self.symbols_to_scan = [] 
+        
+        # Sinyal motorunu başlatıyoruz
+        self.engine = SignalEngine(
+            settings=self.settings,  # GUI'den gelen dict'i geçir
+            log_func=log_func
+        )
+
+    def get_symbols_to_scan(self):
+        """Hacim filtresine göre taranacak coinleri bulur."""
+        self.log("🔍 Coin taraması başlatılıyor...")
+        try:
+            tickers = self.client.ticker_24hr_price_change()
+            
+            try:
+                min_vol_mn = float(self.settings.get('min_volume', 130))
+            except:
+                min_vol_mn = 130.0
+            
+            target_volume = min_vol_mn * 1_000_000
+            final_symbols = []
+            
+            for t in tickers:
+                symbol = t['symbol']
+                if symbol.endswith('USDT') and symbol != 'USDTUSDT':
+                    try:
+                        vol = float(t['quoteVolume'])
+                        
+                        # SADECE BİR KOŞUL: target_volume'dan büyük mü?
+                        if vol >= target_volume:
+                            
+                            final_symbols.append(symbol)
+                                
+                    except Exception as e:
+                        continue
+            
+            self.symbols_to_scan = final_symbols
+            self.log(f"✅ Filtreyi geçen: {len(self.symbols_to_scan)} sembol.")
+            return final_symbols
+                    
+        except Exception as e:
+            self.log(f"❌ Tarama Hatası: {e}", True)
+            self.symbols_to_scan = []
+        return self.symbols_to_scan
+
+    def get_candlesticks(self, symbol, interval, limit=100):
+        """Mum verilerini çeker."""
+        for i in range(3):
+            try:
+                klines = self.client.klines(symbol, interval, limit=limit)
+                df = pd.DataFrame(klines, columns=[
+                    'Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 
+                    'Close time', 'Quote asset volume', 'Number of trades', 
+                    'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'
+                ])
+                if df is None or len(df) < 20:
+                    return None
+                cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                df[cols] = df[cols].astype(float)
+                
+                # Eksik/bozuk veri kontrolü
+                if df['Close'].isna().any() or (df['High'] < df['Low']).any():
+                    self.log(f"❌ Bozuk veri: {symbol}")
+                    return None
+                return df
+            
+            except Exception as e:
+                time.sleep(1)
+        return None
+
+    def calculate_volatility(self, df):
+        # SENİN ORİJİNAL KODUN (DOKUNULMADI)
+        try:
+            if df is None or len(df) < 40:
+                return 1, 0.0
+            
+            # Sütun isimleri büyük harf uyumu
+            close_col = 'Close' if 'Close' in df.columns else 'close'
+            
+            df['Change_Pct'] = df[close_col].pct_change().abs() * 100
+            avg_change_pct = df['Change_Pct'].iloc[-40:].mean() 
+            
+            if avg_change_pct >= 1.0: leverage = 1
+            elif avg_change_pct > 0.4: leverage = 2
+            elif avg_change_pct > 0.2: leverage = 3
+            else: leverage = 5
+            
+            return leverage, avg_change_pct
+        except Exception as e:
+        # Hata durumunda da 2 değer döndür
+            self.log(f"❌ Bozuk volatility: ")
+            return 1, 0.0
+
+    def generate_signal(self, df, symbol=None):
+        """
+        client parametresini kaldırıyoruz - gereksiz karmaşıklık
+        """
+        # SADECE df parametresini gönder
+        signal, score, reason = self.engine.get_composite_score(df)
+        
+        # Mevcut RSI ve BB hesaplaması
+        if 'rsi' not in df.columns:
+            df = self.engine.calculate_indicators(df)
+            
+        rsi = df['rsi'].iloc[-1]
+        bb_upper = df['bb_upper'].iloc[-1]
+        bb_lower = df['bb_lower'].iloc[-1]
+        
+        return signal, reason, rsi, bb_upper, bb_lower
+
+
+********risk.py*************************************************
+
+
+import pandas as pd
+import numpy as np
+import ta.volatility
+
+def calculate_atr(df, period=14):
+    """
+    Average True Range (ATR) hesaplar - GÜVENLİ VERSİYON
+    """
+    try:
+        # Veri yeterliliği kontrolü
+        if len(df) < period + 1:
+            current_price = df['Close'].iloc[-1]
+            return current_price * 0.01  # Fallback: fiyatın %1'i
+            
+        atr_indicator = ta.volatility.AverageTrueRange(
+            high=df['High'], low=df['Low'], close=df['Close'], window=period
+        )
+        atr_series = atr_indicator.average_true_range()
+        
+        atr_value = atr_series.iloc[-1] if not atr_series.empty else 0.0
+        
+        # ATR 0 veya NaN ise alternatif hesapla
+        if atr_value == 0 or pd.isna(atr_value):
+            current_price = df['Close'].iloc[-1]
+            atr_value = current_price * 0.01
+            
+        return atr_value
+    except Exception as e:
+        # Hata durumunda fiyatın %1'ini döndür
+        current_price = df['Close'].iloc[-1]
+        return current_price * 0.01
+
+def calculate_dynamic_stops(df, entry_price, direction, sl_multiplier=2.0, tp_multiplier=3.5):
+    atr_value = calculate_atr(df)
+    
+    min_atr = entry_price * 0.005  # %0.5 minimum
+    if atr_value < min_atr:
+        atr_value = min_atr
+    # YENİ: Volatiliteye göre dinamik SL multiplier
+    volatility = df['Close'].pct_change().std() * 100  # Yüzdelik volatilite
+    dynamic_sl_multiplier = max(1.5, min(3.0, 2.0 / (volatility + 0.1)))
+    
+    # TP multiplier sabit kalabilir veya dinamik yapılabilir
+    dynamic_tp_multiplier = tp_multiplier  # Sabit tutuyoruz
+    
+    if atr_value == 0:
+        atr_value = entry_price * 0.01
+
+    min_stop_dist = entry_price * 0.005 
+    stop_distance = max(atr_value * dynamic_sl_multiplier, min_stop_dist)  # DİNAMİK MULTIPLIER
+    
+    stop_loss = 0.0
+    take_profit = 0.0
+
+    if direction == "LONG":
+        stop_loss = entry_price - stop_distance
+        take_profit = entry_price + (atr_value * dynamic_tp_multiplier)  # SABİT MULTIPLIER
+    elif direction == "SHORT":
+        stop_loss = entry_price + stop_distance
+        take_profit = entry_price - (atr_value * dynamic_tp_multiplier)
+        
+    return stop_loss, take_profit, atr_value
+
+def get_trailing_stop_price(current_price, current_stop_loss, direction, atr_value):
+    """
+    İz Süren Stop (Trailing Stop) Hesaplayıcısı.
+    Pozisyon kardaysa stop'u karı kilitleyecek şekilde ilerletir.
+    
+    Kural: Fiyatın ATR * 1.5 kadar gerisinden stop takip eder.
+    """
+    trail_distance = atr_value * 1.5
+    
+    new_stop_loss = current_stop_loss
+    
+    if direction == "LONG":
+        # Fiyat yükseldikçe stopu yukarı çek (Asla aşağı indirme!)
+        potential_new_stop = current_price - trail_distance
+        if potential_new_stop > current_stop_loss:
+            new_stop_loss = potential_new_stop
+            
+    elif direction == "SHORT":
+        # Fiyat düştükçe stopu aşağı it (Asla yukarı çekme!)
+        potential_new_stop = current_price + trail_distance
+        if potential_new_stop < current_stop_loss:
+            new_stop_loss = potential_new_stop
+            
+    return new_stop_loss
+
+def calc_chandelier_exit(df, direction, atr, period=22, multiplier=3):
+    """Chandelier Exit seviyesini hesaplar"""
+    if len(df) < period:
+        return None
+
+    highest_high = df['High'].rolling(period).max().iloc[-1]
+    lowest_low = df['Low'].rolling(period).min().iloc[-1]
+
+    if direction == "LONG":
+        return highest_high - atr * multiplier
+    else:
+        return lowest_low + atr * multiplier
+    
+
+def calc_swing_exit(df, direction, lookback=5):
+    """Swing high/low kırılmasına göre çıkış sinyali üretir"""
+    if len(df) < lookback + 3:
+        return None
+
+    swing_high = df['High'].rolling(lookback).max().iloc[-2]
+    swing_low = df['Low'].rolling(lookback).min().iloc[-2]
+
+    if direction == "LONG":
+        return swing_low
+    else:
+        return swing_high
+
+def calc_msb_exit(df, direction, lookback=20):
+    """Market Structure kırılımına göre çıkış seviyesi"""
+    if len(df) < lookback + 5:
+        return None
+
+    last_high = df['High'].rolling(lookback).max().iloc[-2]
+    last_low = df['Low'].rolling(lookback).min().iloc[-2]
+
+    if direction == "LONG":
+        return last_low   # fiyat bunun altına inerse MSB exit
+    else:
+        return last_high  # fiyat bunun üstüne çıkarsa MSB exit
+
+
+
+**********structure.py***************************************************
+
+import pandas as pd
+import numpy as np
+
+def detect_structure(df, lookback=5):
+    """
+    Piyasa Yapısını (Market Structure) Analiz Eder.
+    Swing High ve Swing Low noktalarını belirler.
+    
+    lookback: Bir tepenin tepe olması için sağında ve solunda kaç mumun daha düşük olması gerektiği.
+              (5 mum sağ, 5 mum sol = Fraktal yapı)
+    """
+    df = df.copy()
+    
+    # 1. Swing High/Low Tespiti (Yerel Tepeler ve Dipler)
+    # Bir mumun high'ı, önceki 'lookback' ve sonraki 'lookback' kadar mumdan yüksekse Swing High'dır.
+    
+    df['swing_high'] = False
+    df['swing_low'] = False
+    
+    # Not: Bu döngü biraz yavaştır ama en garantisidir. (Pandas rolling ile de yapılabilir ama index kayabiliyor)
+    for i in range(lookback, len(df) - lookback):
+        # High Kontrolü
+        current_high = df['High'].iloc[i]
+        left_side = df['High'].iloc[i-lookback:i].max()
+        right_side = df['High'].iloc[i+1:i+lookback+1].max()
+        
+        if current_high > left_side and current_high > right_side:
+            df.at[df.index[i], 'swing_high'] = True
+            
+        # Low Kontrolü
+        current_low = df['Low'].iloc[i]
+        left_side_low = df['Low'].iloc[i-lookback:i].min()
+        right_side_low = df['Low'].iloc[i+1:i+lookback+1].min()
+        
+        if current_low < left_side_low and current_low < right_side_low:
+            df.at[df.index[i], 'swing_low'] = True
+
+    return df
+
+def check_trend(df):
+    """
+    Son oluşan Swing noktalarına bakarak trendi belirler.
+    Dönüş: 'BULLISH', 'BEARISH' veya 'SIDEWAYS'
+    """
+    # Sadece Swing High ve Low olan satırları al
+    swings = df[(df['swing_high']) | (df['swing_low'])].copy()
+    
+    if len(swings) < 4:
+        return "SIDEWAYS", None # Yeterli veri yok
+    
+    # Son 2 High ve Son 2 Low'u bul
+    last_highs = swings[swings['swing_high']]['High'].tail(2).values
+    last_lows = swings[swings['swing_low']]['Low'].tail(2).values
+    
+    trend = "SIDEWAYS"
+    structure_break = False # BOS var mı?
+    
+    # Yükseliş Trendi: Yeni tepe > Eski tepe VE Yeni dip > Eski dip
+    if len(last_highs) >= 2 and len(last_lows) >= 2:
+        if last_highs[-1] > last_highs[-2] and last_lows[-1] > last_lows[-2]:
+            trend = "BULLISH"
+            
+            # Anlık Fiyat Kontrolü (BOS - Break of Structure)
+            # Eğer şu anki fiyat, son swing high'ı yukarı kırdıysa trend çok güçlüdür.
+            current_close = df['Close'].iloc[-1]
+            if current_close > last_highs[-1]:
+                structure_break = True # Bullish BOS
+                
+    # Düşüş Trendi: Yeni tepe < Eski tepe VE Yeni dip < Eski dip
+    if len(last_highs) >= 2 and len(last_lows) >= 2:
+        if last_highs[-1] < last_highs[-2] and last_lows[-1] < last_lows[-2]:
+            trend = "BEARISH"
+            
+            # Anlık Fiyat Kontrolü (Bearish BOS)
+            current_close = df['Close'].iloc[-1]
+            if current_close < last_lows[-1]:
+                structure_break = True # Bearish BOS
+
+    return trend, structure_break
+
+def detect_msb(df, window=20):
+    """
+    Market Structure Break (MSB) / Change of Character (ChoCH)
+    Trendin tersine döndüğü ilk anı yakalar.
+    Senin basit BOS filtrene benziyor ama Swing noktalarına bakar.
+    """
+    trend, _ = check_trend(df)
+    current_close = df['Close'].iloc[-1]
+    
+    # Son swing low ve high'ı bul
+    try:
+        last_swing_high = df[df['swing_high']]['High'].iloc[-1]
+        last_swing_low = df[df['swing_low']]['Low'].iloc[-1]
+    except:
+        return None
+
+    if trend == "BEARISH" and current_close > last_swing_high:
+        return "BULLISH_MSB" # Düşüş trendinde son tepe yukarı kırıldı! (AL Sinyali başlangıcı)
+        
+    if trend == "BULLISH" and current_close < last_swing_low:
+        return "BEARISH_MSB" # Yükseliş trendinde son dip aşağı kırıldı! (SAT Sinyali başlangıcı)
+        
+    return None
+
+
+
+
+******************fvg.py******************************
+
+
+
+import pandas as pd
+import numpy as np
+
+def detect_fvg(df, lookback=3):
+    """
+    Price Action: Fair Value Gap (FVG) Tespiti
+    Notlar: 3 mumluk formasyon.
+    Bullish FVG: 1. mumun High'ı ile 3. mumun Low'u arasında boşluk kalması.
+    Bearish FVG: 1. mumun Low'u ile 3. mumun High'ı arasında boşluk kalması.
+    """
+    fvg_bullish = []
+    fvg_bearish = []
+    
+    # Veri setinde döngü (Son mumlardan geriye doğru bakmak daha performanslı olabilir ama burada düz mantık gidiyoruz)
+    # i: Şu anki mum (3. mum), i-1: Ortadaki mum, i-2: 1. mum
+    for i in range(2, len(df)):
+        # Mum verilerini al
+        curr_low = df['Low'].iloc[i]      # 3. mumun en düşüğü
+        curr_high = df['High'].iloc[i]    # 3. mumun en yükseği
+        
+        prev_low = df['Low'].iloc[i-1]    # 2. mum
+        prev_high = df['High'].iloc[i-1]
+        
+        first_low = df['Low'].iloc[i-2]   # 1. mum
+        first_high = df['High'].iloc[i-2]
+        
+        # --- BULLISH FVG (Yükseliş Boşluğu) ---
+        # Kural: 1. mumun High'ı < 3. mumun Low'u (Arada boşluk var)
+        # Ayrıca orta mum genelde güçlü yeşil mumdur ama şart değil, boşluk olması yeterli.
+        if first_high < curr_low:
+            gap_size = curr_low - first_high
+            # Çok minik gapleri elemek istersen buraya eşik koyabilirsin (ör: fiyata oranı %0.01)
+            if gap_size > 0:
+                fvg_bullish.append({
+                    'index': i,                  # Gap'in oluştuğu (tamamlandığı) mum indeksi
+                    'top': curr_low,             # Gap üst sınırı
+                    'bottom': first_high,        # Gap alt sınırı
+                    'avg_price': (curr_low + first_high) / 2,
+                    'filled': False              # İleride fiyat buraya değerse True olacak
+                })
+
+        # --- BEARISH FVG (Düşüş Boşluğu) ---
+        # Kural: 1. mumun Low'u > 3. mumun High'ı
+        if first_low > curr_high:
+            gap_size = first_low - curr_high
+            if gap_size > 0:
+                fvg_bearish.append({
+                    'index': i,
+                    'top': first_low,            # Gap üst sınırı
+                    'bottom': curr_high,         # Gap alt sınırı
+                    'avg_price': (first_low + curr_high) / 2,
+                    'filled': False
+                })
+
+    return fvg_bullish, fvg_bearish
+
+def check_fvg_signal(df, fvg_bullish, fvg_bearish):
+    """
+    Son mum kapanışı itibariyle FVG durumuna göre sinyal/skor üretir.
+    """
+    if len(df) == 0: return 0
+    
+    current_price = df['Close'].iloc[-1]
+    signal_score = 0
+    
+    # 1. Bullish FVG Kontrolü (Long Fırsatı)
+    # Fiyat bullish FVG bölgesine geri çekildiyse (retest) ve oradan tepki alıyorsa
+    for fvg in fvg_bullish[-5:]: # Sadece son 5 FVG'ye bakmak yeterli, çok eskiler önemsiz
+        # Fiyat gap'in içine girmiş mi? (Bottom < Price < Top)
+        if fvg['bottom'] <= current_price <= fvg['top']:
+            signal_score += 2 # Destek bölgesinde
+            
+    # 2. Bearish FVG Kontrolü (Short Fırsatı)
+    for fvg in fvg_bearish[-5:]:
+        if fvg['bottom'] <= current_price <= fvg['top']:
+            signal_score -= 2 # Direnç bölgesinde
+
+    return signal_score
+
+# FVG Fill Detection
+def detect_fvg_fill(df, fvg_list):
+    price = df['Close'].iloc[-1]
+    for fvg in fvg_list:
+        if not fvg['filled']:
+            if fvg['bottom'] <= price <= fvg['top']:
+                fvg['filled'] = True
+    return fvg_list
+
+
+# Mitigation Detection (Body ile temizlik)
+def detect_mitigation(df, fvg_list):
+    open_ = df['Open'].iloc[-1]
+    close = df['Close'].iloc[-1]
+
+    low_body = min(open_, close)
+    high_body = max(open_, close)
+
+    for fvg in fvg_list:
+        if fvg.get('filled'):
+            continue
+        if low_body <= fvg['top'] and high_body >= fvg['bottom']:
+            fvg['mitigated'] = True
+            fvg['filled'] = True
+    return fvg_list
+
+
+# Breaker Block Tespiti
+def detect_breaker(df, fvg_list):
+    close = df['Close'].iloc[-1]
+    for fvg in fvg_list:
+        if close > fvg['top']:
+            fvg['breaker'] = 'bullish'
+        elif close < fvg['bottom']:
+            fvg['breaker'] = 'bearish'
+    return fvg_list
+
+
+# # BOS (Break of Structure)  başka dosyaya taşıdık sonra silinecek
+# def bos_filter(df, lookback=10):
+#     highs = df['High'].tail(lookback)
+#     lows = df['Low'].tail(lookback)
+
+#     if highs.iloc[-1] >= highs.max():
+#         return "bullish"
+#     if lows.iloc[-1] <= lows.min():
+#         return "bearish"
+#     return "neutral"
+
+**********************************config.py****************
+
+
+import os
+from dotenv import load_dotenv
+
+# .env dosyasındaki değişkenleri yükle
+load_dotenv()
+
+# Binance API Ayarları
+# Mainnet için
+REAL_API_KEY = os.getenv("REAL_API_KEY")
+REAL_SECRET_KEY = os.getenv("REAL_SECRET_KEY")
+REAL_BASE_URL = "https://fapi.binance.com" # Futures Mainnet API URL'si [cite: 63]
+
+# Testnet için (Geliştirme ve deneme için kullanacağız)
+TESTNET_API_KEY = os.getenv("BINANCE_API_KEY")
+TESTNET_SECRET_KEY = os.getenv("BINANCE_API_SECRET")
+TESTNET_BASE_URL = "https://testnet.binancefuture.com" # Futures Testnet API URL'si [cite: 62]
+
+# Telegram Ayarları
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
